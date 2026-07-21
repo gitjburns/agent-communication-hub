@@ -1,0 +1,38 @@
+# Single package per PLAN.md: one shared library plus two binaries.
+# The dependency list below is fixed by PLAN.md; nothing may be added
+# without explicit approval.
+
+[package]
+name = "agent-communication-hub"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "agent_communication_hub"
+path = "src/lib.rs"
+
+# Server binary: runs only in a protected environment, never on client PATH.
+[[bin]]
+name = "agent-hub-server"
+path = "src/bin/agent-hub-server.rs"
+
+# Client CLI: installed on the shared PATH for all agents.
+[[bin]]
+name = "agent-hub"
+path = "src/bin/agent-hub.rs"
+
+[dependencies]
+# Async is confined to the server's network layer (PRINCIPLES.md); the
+# client binary and all lib logic stay synchronous. Features are limited
+# to what the server's listener, per-connection tasks, and await-timeout
+# timers need.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"

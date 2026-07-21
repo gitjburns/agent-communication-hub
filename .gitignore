@@ -1,0 +1,19 @@
+.claude
+CLAUDE.md
+
+# Build artifacts
+/target
+
+# Operational config is operator-owned and machine-local; only
+# config.example.toml is committed.
+/config.toml
+
+# Credential material: the agent roster and per-agent token files must
+# never be committed (SPEC: mode 600, gitignored).
+roster.toml
+*.token
+tokens/
+
+# Runtime records: service log and append-only audit log.
+*.log
+*.jsonl

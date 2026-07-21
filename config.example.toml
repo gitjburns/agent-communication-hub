@@ -1,0 +1,29 @@
+# Example operational configuration for agent-hub-server.
+#
+# Copy to config.toml (gitignored) and edit for the local machine.
+# Config is strict: every key below is required, unknown keys are fatal,
+# and there are no runtime defaults — the values here are the only place
+# defaults exist.
+
+# TCP port the hub binds on localhost (loopback-only is a hard v1
+# constraint; the bind address is not configurable).
+port = 46110
+
+# Append-only JSONL audit log owned solely by the hub: accepted envelopes
+# in full, deliveries, connections, auth failures. Distinct from the
+# service log below; the two records never merge.
+audit_log_path = "audit.jsonl"
+
+# Service diagnostics log (see DIAGNOSTICS.md).
+service_log_path = "service.log"
+
+# Agent roster: a TOML file mapping agent name -> token, operator-owned,
+# mode 600, never committed. Format:
+#
+#   [agents]
+#   mneme = "example-token"
+#   datastore = "another-token"
+#
+# A missing file, an empty roster, an empty token, or keys outside the
+# [agents] table are fatal startup errors.
+roster_path = "roster.toml"
