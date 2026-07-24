@@ -6,8 +6,10 @@ identity, and wakes sleeping sessions when a message arrives. Topology is
 hub-and-spoke: an orchestrator session dispatches tasks; unattended
 repo-resident sessions block on `await`, do the work, and reply.
 
-The hub never interprets message bodies, never originates envelopes, and
-never modifies envelope content beyond stamping the authenticated sender.
+The hub never interprets message bodies and never modifies envelope
+content beyond stamping the authenticated sender. It originates
+envelopes in exactly one case: a `bounce` notifying a sender of an
+irrecoverably lost delivery.
 
 ## Components
 
@@ -58,7 +60,8 @@ The unit of routing:
 - `to` may name an agent the hub has never seen; unknown destinations are
   accepted and queued deliberately (the agent may connect later).
 - `kind` is `task` or `result` in v1, but the set is extensible: the hub
-  routes unknown kinds without complaint.
+  routes unknown kinds without complaint. `bounce` is reserved for
+  hub-synthesized loss notices.
 - `correlationId` is `null` or the `id` of the envelope this one answers.
 - `body` is opaque. The hub validates envelope fields and never inspects,
   interprets, or transforms the body.
@@ -69,11 +72,19 @@ The unit of routing:
 
 - One in-memory FIFO queue per agent name.
 - A `send` either hands the envelope directly to a parked `await`
-  (correlation-filtered waiters match first, then the oldest unfiltered
-  waiter) or queues it.
-- An `await` consumes at most one envelope. Consumption happens at the
-  write-to-client boundary: the hub's own guarantee is best-effort,
-  **at-most-once** per envelope.
+  (among parked `await`s whose filters all pass, the most specific wins
+  — reply-to plus kind, then reply-to, then kind, then unfiltered —
+  oldest first within a tier) or queues it.
+- An `await` consumes at most one envelope. Consumption commits when the
+  socket accepts the first byte of the write to the client: a write that
+  fails with zero bytes accepted returns the envelope to routing (next
+  matching waiter, else queue front); only a partial write loses it. The
+  hub's own guarantee is best-effort, **at-most-once** per envelope.
+- A partial-write loss is reported to the sender by a hub-synthesized
+  bounce envelope: `from: hub`, `kind: bounce`, `correlationId` set to
+  the lost envelope's id, body naming the lost id, intended recipient,
+  and reason. It is committed and audited like any envelope; a lost
+  bounce is not bounced again.
 - **At-least-once is achieved end-to-end, not by the hub**: the
   orchestrator treats every dispatch as outstanding until its correlated
   result arrives and re-dispatches after a deadline; consumers are
@@ -91,6 +102,9 @@ agent sessions act on with real permissions, so an unauthenticated local
 port would be a prompt-injection surface for any errant local process.
 Tokens live in plain files, mode 600, never committed; the CLI reads a
 token only via `--token-file` — no environment variables, no discovery.
+The name `hub` is reserved as the hub's own synthesized identity; a
+roster defining it is a fatal startup error, so `from: hub` is
+unforgeable.
 
 ### Records
 
@@ -166,8 +180,9 @@ datastore = "<token>"
 
 Any unique secret string works as a token; e.g. generate one with
 `openssl rand -hex 16`. A missing roster file, an empty roster, a blank
-name or token, or keys outside the `[agents]` table are fatal startup
-errors: a hub that can authenticate nobody must not start.
+name or token, the reserved name `hub`, or keys outside the `[agents]`
+table are fatal startup errors: a hub that can authenticate nobody must
+not start.
 
 ### 4. Distribute agent tokens
 
@@ -222,18 +237,21 @@ previous envelope.
 
 ```
 agent-hub await --as datastore --token-file tokens/datastore.token --port 46110 \
-    [--reply-to <id>] [--timeout <secs>]
+    [--reply-to <id>] [--kind <kind>] [--timeout <secs>]
 ```
 
 Blocks until one matching envelope is available, prints it as one JSON
-line on stdout, and exits 0. Without `--reply-to` it matches any
-envelope addressed to the authenticated name; with `--reply-to <id>` it
-matches only envelopes whose `correlationId` equals `<id>` — the
-blocking send-and-wait composite. Without `--timeout` it blocks
-indefinitely.
+line on stdout, and exits 0. Without filters it matches any envelope
+addressed to the authenticated name; with `--reply-to <id>` it matches
+only envelopes whose `correlationId` equals `<id>` — the blocking
+send-and-wait composite; with `--kind <kind>` it matches only envelopes
+of that kind. Filters conjoin: every filter given must pass. Without
+`--timeout` it blocks indefinitely.
 
 This one-shot, exit-on-event contract is what lets `await` double as a
 resident session's background watcher: process exit wakes the session.
+Filtered awaits let a watcher coexist with other waits, e.g.
+`--kind wake`.
 
 ### Exit codes
 

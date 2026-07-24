@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use agent_communication_hub::audit::{AuditEvent, AuditLog, AuthFailureReason};
-use agent_communication_hub::envelope::Envelope;
+use agent_communication_hub::envelope::{self, Envelope};
 use agent_communication_hub::roster::Roster;
 use agent_communication_hub::wire::{self, ClientLine, ServerLine};
 use agent_communication_hub::{config, roster, service_log};
@@ -849,7 +849,8 @@ fn remove_waiter(state: &mut HubState, name: &str, waiter_id: u64) -> bool {
 /// the envelope re-enters routing — next matching waiter, else queue
 /// front — preserving at-most-once, since its delivery count is zero;
 /// only a partial write loses the envelope, the spec's accepted
-/// at-most-once outcome, recovered by end-to-end re-dispatch. The
+/// at-most-once outcome, recovered by end-to-end re-dispatch and
+/// reported to the sender via a hub-synthesized bounce envelope. The
 /// service log distinguishes all three outcomes from the backend match.
 async fn deliver_envelope(
     shared: &Arc<Shared>,
@@ -911,6 +912,21 @@ async fn deliver_envelope(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "delivery failed after partial write: envelope consumed and lost (at-most-once)"
             );
+            // The sender is the one party that can act on the loss;
+            // notify it — unless the lost envelope was itself a bounce
+            // (`from: hub`): `hub` never awaits, so bouncing to it would
+            // grow that queue without bound. For a lost bounce the loss
+            // record above is final.
+            if from != envelope::HUB_NAME {
+                emit_bounce(
+                    shared,
+                    &id,
+                    &from,
+                    name,
+                    "delivery failed after partial write",
+                )
+                .await;
+            }
             return;
         }
     }
@@ -937,6 +953,64 @@ async fn deliver_envelope(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "await delivered envelope"
     );
+}
+
+/// Synthesizes and commits a bounce envelope notifying `sender` that its
+/// envelope `lost_id` (addressed to `recipient`) was irrecoverably lost
+/// during delivery. The bounce goes through `commit_send` like any other
+/// envelope — audited, then routed — so loss becomes an ordinary event
+/// in the sender's stream, watchable via `await --kind bounce`. Its
+/// `correlationId` carries the lost envelope's id so a sender blocked in
+/// `await --reply-to <lost id>` receives the bounce as the answer to
+/// that wait. Callers must not invoke this for a lost bounce
+/// (`from: hub`); see the guard in `deliver_envelope`.
+async fn emit_bounce(
+    shared: &Arc<Shared>,
+    lost_id: &str,
+    sender: &str,
+    recipient: &str,
+    reason: &str,
+) {
+    let bounce = Envelope {
+        id: uuid::Uuid::new_v4().to_string(),
+        from: envelope::HUB_NAME.to_string(),
+        to: sender.to_string(),
+        // Hub clock, informational like any envelope ts; audit append
+        // order remains the authoritative ordering.
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        kind: envelope::BOUNCE_KIND.to_string(),
+        correlation_id: Some(lost_id.to_string()),
+        body: serde_json::json!({
+            "id": lost_id,
+            "to": recipient,
+            "reason": reason,
+        }),
+    };
+    let bounce_id = bounce.id.clone();
+    match commit_send(shared, bounce).await {
+        Ok(SendOutcome::HandedOff) => tracing::info!(
+            bounce_id = %bounce_id,
+            lost_id = %lost_id,
+            sender = %sender,
+            "bounce committed: audited and handed to a parked waiter"
+        ),
+        Ok(SendOutcome::Queued(queue_depth)) => tracing::info!(
+            bounce_id = %bounce_id,
+            lost_id = %lost_id,
+            sender = %sender,
+            queue_depth,
+            "bounce committed: audited and queued for sender"
+        ),
+        // The loss record already written by `deliver_envelope` stays
+        // the only evidence of the lost envelope; this adds that the
+        // sender will not learn of it in-band.
+        Err(cause) => tracing::error!(
+            lost_id = %lost_id,
+            sender = %sender,
+            error = %cause,
+            "bounce could not be committed; sender will not be notified"
+        ),
+    }
 }
 
 /// Appends one event to the audit log from async context. File appends

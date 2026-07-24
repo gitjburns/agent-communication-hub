@@ -11,6 +11,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Reserved sender identity for hub-synthesized envelopes (bounces).
+/// The roster refuses to define this name, and `from` is always stamped
+/// from the authenticated identity, so `from: hub` is unforgeable.
+pub const HUB_NAME: &str = "hub";
+
+/// Kind of a hub-synthesized bounce envelope: the hub's notice to a
+/// sender that a delivery was irrecoverably lost.
+pub const BOUNCE_KIND: &str = "bounce";
+
 /// One routed message. Field names on the wire follow the spec exactly
 /// (`correlationId` is camelCase); everything except `body` is validated
 /// by [`Envelope::validate`].

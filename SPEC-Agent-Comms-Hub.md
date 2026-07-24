@@ -133,6 +133,9 @@ background watcher: process exit wakes the session.
 - The hub's config maps each agent name to a token. Asserted name must
   match presented token; there is no shared secret, so an authenticated
   envelope's `from` is identity, not a claim.
+- The name `hub` is reserved as the hub's own synthesized identity
+  (bounce envelopes): a roster defining it is a fatal startup error, so
+  `from: hub` is unforgeable.
 - Tokens are stored in plain text files, one per agent, mode 600, and never
   committed (gitignored where a repo is involved). The CLI reads the token
   only via `--token-file`; no environment variables, no discovery.
@@ -152,6 +155,13 @@ background watcher: process exit wakes the session.
   accepted returns the envelope to routing (next matching waiter, else
   queue front). Only a partial write — or a peer that dies after
   accepting bytes — loses the envelope.
+- A partial-write loss is reported to the sender by a hub-synthesized
+  bounce envelope: `from: hub`, `kind: bounce`, `correlationId` set to
+  the lost envelope's `id`, body `{"id", "to", "reason"}` naming the lost
+  envelope, its intended recipient, and the failure. The bounce is
+  committed like any envelope — audited, then routed to the sender — and
+  is stateless after emission. A lost bounce is not bounced again; its
+  service-log loss record is final.
 - The protocol achieves at-least-once end-to-end, by contract with the
   endpoints rather than by hub machinery:
   - Mneme treats every dispatch as outstanding until its correlated result

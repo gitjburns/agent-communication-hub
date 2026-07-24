@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::envelope;
+
 /// The parsed roster. Tokens live in memory for the process lifetime;
 /// they must never be logged or echoed — diagnostics may name agents and
 /// counts only.
@@ -48,6 +50,10 @@ pub enum RosterError {
     /// An entry has an empty name or empty token, which would make an
     /// identity unauthenticatable or trivially forgeable.
     BlankEntry { path: PathBuf, name: String },
+    /// An entry uses a reserved name. `hub` is the hub's own synthesized
+    /// identity (bounce envelopes); a roster entry for it would make
+    /// `from: hub` a client claim instead of hub authorship.
+    ReservedName { path: PathBuf, name: String },
 }
 
 impl fmt::Display for RosterError {
@@ -76,6 +82,14 @@ impl fmt::Display for RosterError {
                     name
                 )
             }
+            RosterError::ReservedName { path, name } => {
+                write!(
+                    f,
+                    "roster file {} defines reserved agent name {:?}; it is the hub's own identity",
+                    path.display(),
+                    name
+                )
+            }
         }
     }
 }
@@ -86,7 +100,9 @@ impl std::error::Error for RosterError {
         match self {
             RosterError::Read { source, .. } => Some(source),
             RosterError::Parse { source, .. } => Some(source),
-            RosterError::Empty { .. } | RosterError::BlankEntry { .. } => None,
+            RosterError::Empty { .. }
+            | RosterError::BlankEntry { .. }
+            | RosterError::ReservedName { .. } => None,
         }
     }
 }
@@ -115,6 +131,15 @@ pub fn load(path: &Path) -> Result<Roster, RosterError> {
     for (name, token) in &roster.agents {
         if name.is_empty() || token.is_empty() {
             return Err(RosterError::BlankEntry {
+                path: path.to_path_buf(),
+                name: name.clone(),
+            });
+        }
+        // The hub's own identity must stay unregistrable: with no roster
+        // entry, auth can never mint `from: hub`, so hub-synthesized
+        // envelopes (bounces) are unforgeable.
+        if name == envelope::HUB_NAME {
+            return Err(RosterError::ReservedName {
                 path: path.to_path_buf(),
                 name: name.clone(),
             });

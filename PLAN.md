@@ -76,3 +76,26 @@
   `agent-hub-server` (requires explicit user approval per AGENTS.md), run
   send/await flows including correlation matching and timeout, inspect audit
   and service logs against DIAGNOSTICS.md coverage.
+
+## Post-v1 changes
+
+2026-07-23 — three delivery-path changes from agent-user feedback, each
+reflected in `SPEC-Agent-Comms-Hub.md` and `README.md`:
+
+- [x] Requeue on clean delivery failure. Consumption commits at the first
+  socket-accepted byte (byte-tracked `write_envelope_line` replaces
+  `write_all` on the delivery path); a zero-byte write failure returns the
+  envelope to routing via the extracted `route_envelope` helper (queue
+  front), and only a partial write remains a loss. Cargo-verified only;
+  the clean-failure path has not been exercised live.
+- [x] Predicate-set waiter matching plus `await --kind`. `AwaitFilter`
+  (reply-to, kind conjunction) is the single owner of match semantics for
+  parked waiters and queued envelopes; among matching waiters the most
+  specific wins — {reply-to, kind} > {reply-to} > {kind} > {} — oldest
+  within a tier. Wire `await` line and client CLI carry `kind`.
+- [x] Hub-synthesized bounce envelopes. A partial-write loss emits
+  `from: hub`, `kind: bounce`, `correlationId` = lost envelope id, body
+  `{"id", "to", "reason"}`, committed through `commit_send` (audited,
+  routed normally). `hub` is a reserved roster name (fatal startup error);
+  a lost bounce is not bounced again. Constants `HUB_NAME`/`BOUNCE_KIND`
+  live in `envelope.rs`.
