@@ -143,9 +143,12 @@ background watcher: process exit wakes the session.
 ## Delivery Semantics
 
 - Queues are in-memory, one per agent name, FIFO per queue.
-- The hub's own guarantee is best-effort, at-most-once per envelope: an
-  envelope is consumed when written to a matched `await` client. A client
-  that dies at the wrong instant loses that envelope.
+- The hub's own guarantee is best-effort, at-most-once per envelope:
+  consumption commits when the socket accepts the first byte of the
+  write to a matched `await` client. A write that fails with zero bytes
+  accepted returns the envelope to routing (next matching waiter, else
+  queue front). Only a partial write — or a peer that dies after
+  accepting bytes — loses the envelope.
 - The protocol achieves at-least-once end-to-end, by contract with the
   endpoints rather than by hub machinery:
   - Mneme treats every dispatch as outstanding until its correlated result

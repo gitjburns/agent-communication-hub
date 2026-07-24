@@ -468,6 +468,71 @@ enum SendOutcome {
     Queued(usize),
 }
 
+/// Where an envelope lands on the destination FIFO when no waiter
+/// matches: a newly committed send parks at the back (arrival order),
+/// while an envelope requeued after a clean delivery failure reclaims
+/// the front — it was already the oldest deliverable traffic for the
+/// agent, and sends accepted while it was out must not overtake it.
+enum QueuePlacement {
+    Back,
+    Front,
+}
+
+/// Routes one committed (audited) envelope under the state lock.
+/// Matching order per spec: a correlation-filtered waiter whose reply-to
+/// equals this envelope's correlationId wins first, then the oldest
+/// unfiltered waiter, else the envelope queues at `placement`. The loop
+/// exists because a matched waiter can be dead (its task gone after
+/// registering): a failed handoff returns the envelope and the next
+/// candidate is tried. Callers: `commit_send` for new sends (under the
+/// audit lock, preserving audit/routing order agreement) and the clean
+/// delivery-failure requeue path (state lock only — the envelope's
+/// acceptance is already audited, so no audit ordering is at stake).
+fn route_envelope(
+    state: &mut HubState,
+    envelope: Envelope,
+    placement: QueuePlacement,
+) -> SendOutcome {
+    let mut envelope = envelope;
+    while let Some(waiters) = state.waiters.get_mut(&envelope.to) {
+        let matched = waiters
+            .iter()
+            .position(|waiter| {
+                // The is_some guard keeps an unfiltered waiter from
+                // matching here when the envelope has no correlation.
+                waiter.reply_to.is_some() && waiter.reply_to == envelope.correlation_id
+            })
+            .or_else(|| waiters.iter().position(|waiter| waiter.reply_to.is_none()));
+        let Some(index) = matched else {
+            break;
+        };
+        let waiter = waiters.remove(index);
+        if waiters.is_empty() {
+            state.waiters.remove(&envelope.to);
+        }
+        match waiter.tx.send(envelope) {
+            Ok(()) => return SendOutcome::HandedOff,
+            // Receiver dropped: the waiter's task died after
+            // registering. Reclaim the envelope; the dead waiter
+            // stays removed.
+            Err(returned) => {
+                tracing::warn!(
+                    waiter_id = waiter.id,
+                    to = %returned.to,
+                    "purged dead waiter during handoff"
+                );
+                envelope = returned;
+            }
+        }
+    }
+    let queue = state.queues.entry(envelope.to.clone()).or_default();
+    match placement {
+        QueuePlacement::Back => queue.push_back(envelope),
+        QueuePlacement::Front => queue.push_front(envelope),
+    }
+    SendOutcome::Queued(queue.len())
+}
+
 /// Commits one validated, `from`-stamped envelope: audit append, then
 /// waiter handoff or enqueue, all inside the audit mutex. Holding the
 /// audit lock across the routing step makes the audit file's append
@@ -497,47 +562,7 @@ async fn commit_send(shared: &Arc<Shared>, envelope: Envelope) -> Result<SendOut
         };
         audit.write(&event).map_err(|error| error.to_string())?;
         let mut state = lock_state(&shared);
-        // Matching order per spec: a correlation-filtered waiter whose
-        // reply-to equals this envelope's correlationId wins first, then
-        // the oldest unfiltered waiter, else the envelope queues. The
-        // loop exists because a matched waiter can be dead (its task
-        // gone after registering): a failed handoff returns the envelope
-        // and the next candidate is tried.
-        let mut envelope = envelope;
-        while let Some(waiters) = state.waiters.get_mut(&envelope.to) {
-            let matched = waiters
-                .iter()
-                .position(|waiter| {
-                    // The is_some guard keeps an unfiltered waiter from
-                    // matching here when the envelope has no correlation.
-                    waiter.reply_to.is_some() && waiter.reply_to == envelope.correlation_id
-                })
-                .or_else(|| waiters.iter().position(|waiter| waiter.reply_to.is_none()));
-            let Some(index) = matched else {
-                break;
-            };
-            let waiter = waiters.remove(index);
-            if waiters.is_empty() {
-                state.waiters.remove(&envelope.to);
-            }
-            match waiter.tx.send(envelope) {
-                Ok(()) => return Ok(SendOutcome::HandedOff),
-                // Receiver dropped: the waiter's task died after
-                // registering. Reclaim the envelope; the dead waiter
-                // stays removed.
-                Err(returned) => {
-                    tracing::warn!(
-                        waiter_id = waiter.id,
-                        to = %returned.to,
-                        "purged dead waiter during handoff"
-                    );
-                    envelope = returned;
-                }
-            }
-        }
-        let queue = state.queues.entry(envelope.to.clone()).or_default();
-        queue.push_back(envelope);
-        Ok(SendOutcome::Queued(queue.len()))
+        Ok(route_envelope(&mut state, envelope, QueuePlacement::Back))
     })
     .await;
     match result {
@@ -756,12 +781,15 @@ fn remove_waiter(state: &mut HubState, name: &str, waiter_id: u64) -> bool {
     true
 }
 
-/// Delivers one envelope to this connection's await client. The write to
-/// the client is the consumption boundary per spec: on write success the
-/// delivery audit record is appended; on failure the envelope is lost —
-/// the spec's accepted at-most-once outcome, recovered by end-to-end
-/// re-dispatch — and the service log carries the loss evidence,
-/// distinguishing the successful backend match from the failed delivery.
+/// Delivers one envelope to this connection's await client. Consumption
+/// commits when the socket accepts the first byte per spec: on full
+/// write success the delivery audit record is appended; on a clean
+/// failure (zero bytes accepted, so the peer provably received nothing)
+/// the envelope re-enters routing — next matching waiter, else queue
+/// front — preserving at-most-once, since its delivery count is zero;
+/// only a partial write loses the envelope, the spec's accepted
+/// at-most-once outcome, recovered by end-to-end re-dispatch. The
+/// service log distinguishes all three outcomes from the backend match.
 async fn deliver_envelope(
     shared: &Arc<Shared>,
     writer: &mut OwnedWriteHalf,
@@ -777,18 +805,53 @@ async fn deliver_envelope(
     let id = envelope.id.clone();
     let from = envelope.from.clone();
     let kind = envelope.kind.clone();
-    if !write_line(writer, peer, &ServerLine::Envelope(envelope)).await {
-        // write_line logged the socket failure; this record adds the
-        // protocol consequence and the lost envelope's identifiers.
-        tracing::error!(
-            %peer,
-            name = %name,
-            id = %id,
-            source,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "delivery failed: envelope consumed and lost (at-most-once)"
-        );
-        return;
+    match write_envelope_line(writer, peer, envelope).await {
+        EnvelopeWrite::Written => {}
+        EnvelopeWrite::FailedClean(envelope) => {
+            // Zero bytes reached the peer, so delivery provably did not
+            // happen; reroute instead of dropping. The short, I/O-free
+            // critical section justifies locking the std mutex from
+            // async context, as in `handle_await`. State lock only —
+            // acceptance is already audited, so the audit lock (and the
+            // audit-before-state order) is not in play.
+            let outcome = route_envelope(&mut lock_state(shared), envelope, QueuePlacement::Front);
+            match outcome {
+                SendOutcome::HandedOff => tracing::warn!(
+                    %peer,
+                    name = %name,
+                    id = %id,
+                    source,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "delivery failed cleanly: envelope handed to next waiter"
+                ),
+                SendOutcome::Queued(queue_depth) => tracing::warn!(
+                    %peer,
+                    name = %name,
+                    id = %id,
+                    source,
+                    queue_depth,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "delivery failed cleanly: envelope requeued at queue front"
+                ),
+            }
+            return;
+        }
+        EnvelopeWrite::FailedPartial { written } => {
+            // write_envelope_line logged the socket failure; this record
+            // adds the protocol consequence and the lost envelope's
+            // identifiers. The peer may hold a fragment, so consumption
+            // is ambiguous and requeue could deliver twice.
+            tracing::error!(
+                %peer,
+                name = %name,
+                id = %id,
+                source,
+                written,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "delivery failed after partial write: envelope consumed and lost (at-most-once)"
+            );
+            return;
+        }
     }
     audit_append(
         shared,
@@ -938,6 +1001,77 @@ async fn write_line(writer: &mut OwnedWriteHalf, peer: SocketAddr, line: &Server
         return false;
     }
     true
+}
+
+/// How a byte-tracked envelope write ended. The clean/partial split is
+/// what makes requeue safe: zero accepted bytes proves the peer received
+/// nothing, so the envelope's delivery count is unambiguously zero.
+enum EnvelopeWrite {
+    /// Every byte reached the socket; consumption is committed.
+    Written,
+    /// The write failed before the socket accepted any byte. Carries the
+    /// envelope back so the caller can reroute it.
+    FailedClean(Envelope),
+    /// The write failed after the socket accepted `written` bytes: the
+    /// peer may hold a fragment, so consumption is ambiguous and the
+    /// envelope must be treated as consumed.
+    FailedPartial { written: usize },
+}
+
+/// Writes one envelope line to the peer, tracking accepted bytes so a
+/// failure reports whether the peer received anything. `write_line`'s
+/// `write_all` cannot make that distinction, and delivery policy depends
+/// on it: zero accepted bytes allows requeue, any accepted byte forces
+/// consume-and-drop.
+async fn write_envelope_line(
+    writer: &mut OwnedWriteHalf,
+    peer: SocketAddr,
+    envelope: Envelope,
+) -> EnvelopeWrite {
+    // The envelope is wrapped for serialization, then immediately
+    // reclaimed so every failure path below can return it by value.
+    let line = ServerLine::Envelope(envelope);
+    let serialized = wire::to_jsonl(&line);
+    let ServerLine::Envelope(envelope) = line else {
+        // Locally proven: `line` is constructed as `Envelope` above and
+        // never reassigned.
+        unreachable!("line constructed as ServerLine::Envelope above")
+    };
+    let jsonl = match serialized {
+        Ok(jsonl) => jsonl,
+        Err(error) => {
+            // Failing to serialize our own typed line is a hub bug, not a
+            // peer problem; log it as such. No bytes reached the socket,
+            // so the envelope is reclaimable.
+            tracing::error!(%peer, error = %error, "cannot serialize server line");
+            return EnvelopeWrite::FailedClean(envelope);
+        }
+    };
+    let bytes = jsonl.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]).await {
+            // Ok(0) with a nonempty buffer means the socket accepts no
+            // further bytes (the io::Write contract's WriteZero case);
+            // treat it as a failure at the current count.
+            Ok(0) => {
+                tracing::warn!(%peer, written, "socket accepted zero bytes writing envelope line");
+                break;
+            }
+            Ok(n) => written += n,
+            Err(error) => {
+                tracing::warn!(%peer, error = %error, written, "failed writing envelope line to peer");
+                break;
+            }
+        }
+    }
+    if written >= bytes.len() {
+        EnvelopeWrite::Written
+    } else if written == 0 {
+        EnvelopeWrite::FailedClean(envelope)
+    } else {
+        EnvelopeWrite::FailedPartial { written }
+    }
 }
 
 /// Names a client line's verb for diagnostics without echoing its payload
