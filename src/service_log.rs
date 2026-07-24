@@ -2,9 +2,11 @@
 //!
 //! The service log is the durable diagnostic record: once initialized,
 //! every meaningful lifecycle boundary and error path must leave evidence
-//! there. The subscriber installed here also mirrors every event to
-//! stdout so the operator can watch the hub live; the file remains the
-//! authoritative record and the console never substitutes for it. This
+//! there. The subscriber installed here also mirrors every file event to
+//! stdout so the operator can watch the hub live, and additionally
+//! admits console-only payload debug events (see `PAYLOAD_TARGET`); the
+//! file remains the authoritative record and the console never
+//! substitutes for it. This
 //! module only installs the logger; the channel rule for the pre-logger
 //! boundary (fatal startup errors that can only reach stderr) is owned by
 //! the server's `main`.
@@ -14,9 +16,35 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
+
+/// Tracing target for console-only full-payload debug events. Events
+/// emitted at DEBUG under this target reach the stdout mirror but are
+/// filtered out of the service log file, which DIAGNOSTICS.md forbids
+/// from carrying payload content. Emitters and the stdout filter must
+/// share this constant so the cross-file contract is compile-time safe.
+pub const PAYLOAD_TARGET: &str = "payload";
+
+/// Timer for the stdout mirror only: local wall-clock time rendered as
+/// `MM-DD-YYYY HH:MM:SS AM|PM` for operator readability. The console
+/// deliberately trades sub-second precision and zone explicitness for
+/// legibility; the file layer keeps the default ISO 8601 UTC timestamps
+/// because the file is the authoritative durable record.
+struct ConsoleTime;
+
+impl FormatTime for ConsoleTime {
+    // Writes the current local time; the trailing space separating the
+    // time from the log message is the caller's convention (the default
+    // timer relies on the same separator the fmt layer inserts).
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%m-%d-%Y %I:%M:%S %p"))
+    }
+}
 
 /// Why service-log initialization failed. This failure happens at the
 /// pre-logger boundary, so its `Display` output on stderr is the only
@@ -72,8 +100,12 @@ impl std::error::Error for ServiceLogError {
 ///
 /// The file layer is the durable authoritative record (DIAGNOSTICS.md);
 /// the stdout layer is a live operator mirror that repeats the same
-/// facts and never substitutes for the file. One shared INFO filter
-/// keeps the two views identical event-for-event.
+/// facts and never substitutes for the file. The layers carry separate
+/// filters: the file admits INFO and above only, while stdout admits
+/// the same events plus DEBUG under `PAYLOAD_TARGET` — so the console
+/// is a strict superset of the file (every file event, plus
+/// console-only payload debug lines that must never reach the durable
+/// record).
 ///
 /// The file writer is deliberately synchronous (no `tracing_appender`
 /// non-blocking worker): the non-blocking channel drops lines under
@@ -108,21 +140,29 @@ pub fn init(path: &Path) -> Result<(), ServiceLogError> {
     // ANSI colors are terminal decoration: they would corrupt the file
     // record, so the file layer never emits them, and the stdout mirror
     // emits them only when stdout is actually a terminal (a redirected
-    // stdout is a file record too). Level is fixed at INFO for both
-    // layers: DIAGNOSTICS.md coverage is written at info/warn/error, and
-    // an environment-driven filter would be an undocumented behavior
-    // override.
+    // stdout is a file record too). Filters are fixed per layer, never
+    // environment-driven: DIAGNOSTICS.md coverage is written at
+    // info/warn/error, so the file admits INFO and above; stdout adds
+    // DEBUG for `PAYLOAD_TARGET` only — a blanket DEBUG would also
+    // surface dependency-internal debug noise, and payload events must
+    // stay out of the file per DIAGNOSTICS.md Forbidden Log Data.
     tracing_subscriber::registry()
-        .with(LevelFilter::INFO)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(appender)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(LevelFilter::INFO),
         )
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stdout)
-                .with_ansi(std::io::stdout().is_terminal()),
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_timer(ConsoleTime)
+                .with_filter(
+                    Targets::new()
+                        .with_default(LevelFilter::INFO)
+                        .with_target(PAYLOAD_TARGET, LevelFilter::DEBUG),
+                ),
         )
         .try_init()
         .map_err(|source| ServiceLogError::Subscriber { source })?;

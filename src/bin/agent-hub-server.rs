@@ -33,6 +33,7 @@ use tokio::sync::oneshot;
 use agent_communication_hub::audit::{AuditEvent, AuditLog, AuthFailureReason};
 use agent_communication_hub::envelope::{self, Envelope};
 use agent_communication_hub::roster::Roster;
+use agent_communication_hub::service_log::PAYLOAD_TARGET;
 use agent_communication_hub::wire::{self, ClientLine, ServerLine};
 use agent_communication_hub::{config, roster, service_log};
 
@@ -589,6 +590,38 @@ fn route_envelope(
     SendOutcome::Queued(queue.len())
 }
 
+/// Emits the console-only full-envelope debug trace. DEBUG under
+/// `PAYLOAD_TARGET` reaches stdout but never the service log file, which
+/// DIAGNOSTICS.md forbids from carrying payload content; the audit log
+/// remains the authoritative payload record. Rendering is for human
+/// operators, not machines: routing metadata rides as ordinary event
+/// fields on the header line, and only the arbitrary-JSON `body` is
+/// pretty-printed, as an indented block on the lines below (the leading
+/// newline in the field value creates that block). A serialization
+/// failure is reported (without content) instead of silently dropping
+/// the trace, and never disturbs the envelope's own path — the caller
+/// proceeds regardless.
+fn trace_payload(direction: &'static str, envelope: &Envelope) {
+    match serde_json::to_string_pretty(&envelope.body) {
+        Ok(body) => {
+            tracing::debug!(
+                target: PAYLOAD_TARGET,
+                direction,
+                id = %envelope.id,
+                from = %envelope.from,
+                to = %envelope.to,
+                kind = %envelope.kind,
+                correlation_id = %envelope.correlation_id.as_deref().unwrap_or("none"),
+                body = %format!("\n{body}"),
+                "envelope payload"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(direction, id = %envelope.id, error = %error, "payload trace: body serialization failed");
+        }
+    }
+}
+
 /// Commits one validated, `from`-stamped envelope: audit append, then
 /// waiter handoff or enqueue, all inside the audit mutex. Holding the
 /// audit lock across the routing step makes the audit file's append
@@ -597,6 +630,9 @@ fn route_envelope(
 /// nothing was routed. File appends are blocking work, so the whole
 /// commit runs on the blocking pool.
 async fn commit_send(shared: &Arc<Shared>, envelope: Envelope) -> Result<SendOutcome, String> {
+    // Every envelope entering the hub — client sends and hub bounces —
+    // passes here exactly once, making this the single inbound trace point.
+    trace_payload("inbound", &envelope);
     let shared = Arc::clone(shared);
     let result = tokio::task::spawn_blocking(move || {
         // Lock order rule (see `Shared`): audit before state.
@@ -863,10 +899,14 @@ async fn deliver_envelope(
 ) {
     // Safe identifiers for the completion/failure records; the envelope
     // itself moves into the wire line and `body` never reaches the
-    // service log.
+    // service log (the payload trace below is console-only).
     let id = envelope.id.clone();
     let from = envelope.from.clone();
     let kind = envelope.kind.clone();
+    // Outbound trace point: every delivery attempt passes here, whether
+    // the envelope came off the queue or via live handoff. A clean
+    // delivery failure re-enters routing and traces again on retry.
+    trace_payload("outbound", &envelope);
     match write_envelope_line(writer, peer, envelope).await {
         EnvelopeWrite::Written => {}
         EnvelopeWrite::FailedClean(envelope) => {
