@@ -109,7 +109,7 @@ envelope's `id`, exits.
 ### `hub await`
 
 ```
-hub await --as <name> --token-file <path> [--reply-to <id>] [--timeout <secs>]
+hub await --as <name> --token-file <path> [--reply-to <id>] [--kind <kind>] [--timeout <secs>]
 ```
 
 Connects, authenticates, blocks until one matching envelope is available,
@@ -117,13 +117,16 @@ emits it as one JSON line on stdout, exits 0. This one-shot,
 exit-on-event contract is what makes `await` double as the resident's
 background watcher: process exit wakes the session.
 
-- Without `--reply-to`: matches any envelope addressed to `<name>`.
+- Without filters: matches any envelope addressed to `<name>`.
 - With `--reply-to <id>`: matches only envelopes whose `correlationId`
   equals `<id>` — the blocking send-and-wait composite.
+- With `--kind <kind>`: matches only envelopes of that kind. Filters
+  conjoin: an envelope must pass every filter given.
 - `--timeout` elapsed: exit with a distinct nonzero code, nothing consumed.
 - Routing when multiple `await`s are active for one agent: an envelope goes
-  to at most one consumer; correlation-filtered awaits are matched first,
-  then an unfiltered await, else the envelope queues.
+  to at most one consumer; among awaits whose filters all pass, the most
+  specific wins — reply-to plus kind, then reply-to, then kind, then
+  unfiltered — oldest first within a tier; else the envelope queues.
 
 ## Authentication
 

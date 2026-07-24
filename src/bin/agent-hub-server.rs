@@ -81,12 +81,54 @@ struct HubState {
 struct Waiter {
     /// Registry removal key for the timeout path.
     id: u64,
-    /// `None` matches any envelope for the agent; `Some(id)` only
-    /// envelopes whose `correlationId` equals `id`.
-    reply_to: Option<String>,
+    /// Which envelopes this waiter will accept.
+    filter: AwaitFilter,
     /// Handoff channel: sending transfers envelope ownership to the
     /// waiter's connection task, which owns the delivery boundary.
     tx: oneshot::Sender<Envelope>,
+}
+
+/// The predicate set one `await` carries: an envelope is deliverable to
+/// this await iff every present predicate passes (conjunction). The
+/// single owner of match semantics for both parked waiters and queued
+/// envelopes. Adding a future filter (`from`, say) means a field here
+/// plus a clause in `matches` and a slot in `specificity` — the routing
+/// engine itself stays untouched.
+struct AwaitFilter {
+    /// `None` matches any correlationId; `Some(id)` only envelopes
+    /// whose `correlationId` equals `id`.
+    reply_to: Option<String>,
+    /// `None` matches any kind; `Some(kind)` only envelopes of that
+    /// kind.
+    kind: Option<String>,
+}
+
+impl AwaitFilter {
+    /// Whether an envelope passes every present predicate.
+    fn matches(&self, envelope: &Envelope) -> bool {
+        if let Some(reply_to) = &self.reply_to {
+            // An envelope without a correlationId never matches a
+            // reply-to filter (accepted envelopes never carry an empty
+            // one, so equality with a non-empty filter is impossible).
+            if envelope.correlation_id.as_deref() != Some(reply_to.as_str()) {
+                return false;
+            }
+        }
+        if let Some(kind) = &self.kind
+            && envelope.kind != *kind
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Specificity rank for waiter arbitration: among waiters that all
+    /// match an envelope, the most specific wins. A correlation filter
+    /// outranks a kind filter, so tuple comparison yields the spec's
+    /// order {reply_to, kind} > {reply_to} > {kind} > {}.
+    fn specificity(&self) -> (bool, bool) {
+        (self.reply_to.is_some(), self.kind.is_some())
+    }
 }
 
 /// Locks the routing state, recovering from a poisoned lock. Queue and
@@ -363,9 +405,19 @@ async fn serve_connection(shared: &Arc<Shared>, stream: TcpStream, peer: SocketA
         }
         ClientLine::Await {
             reply_to,
+            kind,
             timeout_secs,
         } => {
-            handle_await(shared, &mut writer, peer, &name, reply_to, timeout_secs).await;
+            handle_await(
+                shared,
+                &mut writer,
+                peer,
+                &name,
+                reply_to,
+                kind,
+                timeout_secs,
+            )
+            .await;
         }
         ClientLine::Hello { .. } => {
             tracing::warn!(%peer, name = %name, "duplicate hello after authentication");
@@ -479,10 +531,10 @@ enum QueuePlacement {
 }
 
 /// Routes one committed (audited) envelope under the state lock.
-/// Matching order per spec: a correlation-filtered waiter whose reply-to
-/// equals this envelope's correlationId wins first, then the oldest
-/// unfiltered waiter, else the envelope queues at `placement`. The loop
-/// exists because a matched waiter can be dead (its task gone after
+/// Matching order per spec: among waiters whose predicates all pass, the
+/// most specific wins (see `AwaitFilter::specificity`), oldest first
+/// within a rank; with no match the envelope queues at `placement`. The
+/// loop exists because a matched waiter can be dead (its task gone after
 /// registering): a failed handoff returns the envelope and the next
 /// candidate is tried. Callers: `commit_send` for new sends (under the
 /// audit lock, preserving audit/routing order agreement) and the clean
@@ -495,15 +547,19 @@ fn route_envelope(
 ) -> SendOutcome {
     let mut envelope = envelope;
     while let Some(waiters) = state.waiters.get_mut(&envelope.to) {
-        let matched = waiters
-            .iter()
-            .position(|waiter| {
-                // The is_some guard keeps an unfiltered waiter from
-                // matching here when the envelope has no correlation.
-                waiter.reply_to.is_some() && waiter.reply_to == envelope.correlation_id
-            })
-            .or_else(|| waiters.iter().position(|waiter| waiter.reply_to.is_none()));
-        let Some(index) = matched else {
+        // Strict `>` keeps the oldest waiter within a specificity rank:
+        // a later equal-rank waiter never displaces an earlier one.
+        let mut best: Option<(usize, (bool, bool))> = None;
+        for (index, waiter) in waiters.iter().enumerate() {
+            if !waiter.filter.matches(&envelope) {
+                continue;
+            }
+            let rank = waiter.filter.specificity();
+            if best.is_none_or(|(_, best_rank)| rank > best_rank) {
+                best = Some((index, rank));
+            }
+        }
+        let Some((index, _)) = best else {
             break;
         };
         let waiter = waiters.remove(index);
@@ -597,6 +653,7 @@ async fn handle_await(
     peer: SocketAddr,
     name: &str,
     reply_to: Option<String>,
+    kind: Option<String>,
     timeout_secs: Option<u64>,
 ) {
     let started = Instant::now();
@@ -609,10 +666,20 @@ async fn handle_await(
         write_line(writer, peer, &ServerLine::Error { message }).await;
         return;
     }
+    // Same mirror for EmptyKind: accepted envelopes never carry an empty
+    // kind, so an empty kind filter could match nothing, ever.
+    if matches!(&kind, Some(kind) if kind.is_empty()) {
+        tracing::warn!(%peer, name = %name, "await rejected: kind is empty");
+        let message = "invalid await: kind is empty; omit it or use an envelope kind".to_string();
+        write_line(writer, peer, &ServerLine::Error { message }).await;
+        return;
+    }
+    let filter = AwaitFilter { reply_to, kind };
     tracing::info!(
         %peer,
         name = %name,
-        reply_to = ?reply_to,
+        reply_to = ?filter.reply_to,
+        kind = ?filter.kind,
         timeout_secs = ?timeout_secs,
         "await accepted"
     );
@@ -626,7 +693,7 @@ async fn handle_await(
     // (unlike `commit_send`, whose file append needs the blocking pool).
     let start = {
         let mut state = lock_state(shared);
-        match take_queued(&mut state, name, reply_to.as_deref()) {
+        match take_queued(&mut state, name, &filter) {
             Some(envelope) => AwaitStart::Immediate(envelope),
             None => {
                 let (tx, rx) = oneshot::channel();
@@ -638,7 +705,7 @@ async fn handle_await(
                     .or_default()
                     .push(Waiter {
                         id: waiter_id,
-                        reply_to: reply_to.clone(),
+                        filter,
                         tx,
                     });
                 AwaitStart::Parked { waiter_id, rx }
@@ -740,20 +807,14 @@ async fn wait_for_handoff(
     }
 }
 
-/// Consumes the first queued envelope matching an await from `name`:
-/// with a reply-to filter, the first envelope whose correlationId equals
-/// it — which may sit mid-queue; correlation matches deliberately jump
-/// the FIFO per the spec's matching rules — and without a filter, the
-/// queue front. Returns `None` when nothing matches; the caller then
-/// parks a waiter.
-fn take_queued(state: &mut HubState, name: &str, reply_to: Option<&str>) -> Option<Envelope> {
+/// Consumes the first queued envelope passing every predicate of the
+/// await's filter — which may sit mid-queue; filtered matches
+/// deliberately jump the FIFO per the spec's matching rules, while an
+/// unfiltered await takes the queue front. Returns `None` when nothing
+/// matches; the caller then parks a waiter.
+fn take_queued(state: &mut HubState, name: &str, filter: &AwaitFilter) -> Option<Envelope> {
     let queue = state.queues.get_mut(name)?;
-    let index = match reply_to {
-        Some(reply_to) => queue
-            .iter()
-            .position(|envelope| envelope.correlation_id.as_deref() == Some(reply_to))?,
-        None => 0,
-    };
+    let index = queue.iter().position(|envelope| filter.matches(envelope))?;
     let envelope = queue.remove(index)?;
     // Drop the entry when emptied so arbitrary destination names cannot
     // grow the queue map without bound.

@@ -30,10 +30,13 @@ pub enum ClientLine {
     /// nothing, a guarantee a client-side socket deadline cannot make.
     #[serde(rename_all = "camelCase")]
     Await {
-        /// `None` matches any envelope addressed to the authenticated
-        /// name; `Some(id)` matches only envelopes whose `correlationId`
-        /// equals `id`.
+        /// `None` matches any correlationId; `Some(id)` matches only
+        /// envelopes whose `correlationId` equals `id`. Conjoined with
+        /// `kind`: an envelope must pass every present filter.
         reply_to: Option<String>,
+        /// `None` matches any kind; `Some(kind)` matches only envelopes
+        /// whose `kind` equals it. Conjoined with `reply_to`.
+        kind: Option<String>,
         /// `None` blocks indefinitely (the CLI's `--timeout` is
         /// optional).
         timeout_secs: Option<u64>,

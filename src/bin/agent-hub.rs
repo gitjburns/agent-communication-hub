@@ -95,9 +95,13 @@ struct AwaitArgs {
     #[command(flatten)]
     conn: ConnectionArgs,
     /// Deliver only envelopes whose correlationId equals this id;
-    /// omitted matches any envelope addressed to the authenticated name.
+    /// omitted matches any correlationId. Filters conjoin: an envelope
+    /// must pass every filter given.
     #[arg(long, value_name = "id")]
     reply_to: Option<String>,
+    /// Deliver only envelopes of this kind; omitted matches any kind.
+    #[arg(long, value_name = "kind")]
+    kind: Option<String>,
     /// Hub-side timeout in seconds; omitted blocks indefinitely. On
     /// timeout nothing is consumed, guaranteed by the hub.
     #[arg(long, value_name = "secs")]
@@ -244,6 +248,7 @@ fn run_await(args: AwaitArgs) -> Result<ExitCode, ClientError> {
     let mut hub = connect_and_authenticate(&args.conn)?;
     hub.write_line(&ClientLine::Await {
         reply_to: args.reply_to,
+        kind: args.kind,
         timeout_secs: args.timeout,
     })?;
     match hub.read_reply("envelope or timeout")? {
