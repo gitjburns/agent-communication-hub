@@ -1,5 +1,8 @@
 .claude
 CLAUDE.md
+AGENTS.md
+IN-PROG.md
+ONBOARD.md
 
 # Build artifacts
 /target
@@ -17,3 +20,4 @@ tokens/
 # Runtime records: service log and append-only audit log.
 *.log
 *.jsonl
+
